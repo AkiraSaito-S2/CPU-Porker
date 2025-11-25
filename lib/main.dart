@@ -1,5 +1,5 @@
 import 'package:flutter/material.dart';
-import 'package:flutter/services.dart'; // システム音のために追加
+import 'package:flutter/services.dart';
 import 'dart:math';
 
 void main() {
@@ -32,7 +32,8 @@ class PokerApp extends StatelessWidget {
 
 enum Suit { spade, heart, diamond, club }
 enum Rank { two, three, four, five, six, seven, eight, nine, ten, jack, queen, king, ace }
-enum GamePhase { preFlop, flop, turn, river, showDown }
+// gameOverを追加
+enum GamePhase { preFlop, flop, turn, river, showDown, gameOver }
 
 enum HandRank {
   highCard, onePair, twoPair, threeOfAKind, straight, flush, fullHouse, fourOfAKind, straightFlush, royalFlush
@@ -97,7 +98,7 @@ class Deck {
 }
 
 // ---------------------------------------------------------------------------
-// Evaluator & AI (Hand Range Estimation implemented)
+// Evaluator & AI
 // ---------------------------------------------------------------------------
 
 class HandStrength implements Comparable<HandStrength> {
@@ -342,7 +343,18 @@ class PokerGameEngine extends ChangeNotifier {
   
   int get maxRaiseAmount => playerStack + playerStreetBet;
 
+  // 全リセットして最初から始める
+  void resetWholeGame() {
+    playerStack = 1000;
+    cpuStack = 1000;
+    // ボタン位置などもリセットしたい場合はここで
+    isPlayerButton = true; 
+    startNewGame();
+  }
+
   void startNewGame() {
+    // 破産チェックはShowDown後に行うため、ここでは自動補充しない
+    
     _deck = Deck();
     playerHand = [_deck.draw(), _deck.draw()];
     cpuHand = [_deck.draw(), _deck.draw()];
@@ -350,12 +362,6 @@ class PokerGameEngine extends ChangeNotifier {
     _phase = GamePhase.preFlop;
     cpuThought = "";
     
-    if (playerStack < bigBlind || cpuStack < bigBlind) {
-      playerStack = 1000;
-      cpuStack = 1000;
-      message = "チップを補充しました！";
-    }
-
     isPlayerButton = !isPlayerButton;
     pot = 0;
     playerStreetBet = 0;
@@ -422,10 +428,8 @@ class PokerGameEngine extends ChangeNotifier {
   }
 
   Future<void> _cpuTurn() async {
-    if (_phase == GamePhase.showDown) return;
-    message = "CPU: 思考中...";
-    notifyListeners();
-
+    if (_phase == GamePhase.showDown || _phase == GamePhase.gameOver) return;
+    
     int toCall = playerStreetBet - cpuStreetBet;
 
     final aiResult = await MonteCarloAI.decideAction(
@@ -443,7 +447,7 @@ class PokerGameEngine extends ChangeNotifier {
     String reason = aiResult['reason'];
 
     if (action == "Fold") {
-      cpuThought = "勝率: ${(winRate * 100).toStringAsFixed(1)}% -> Fold\n($reason)";
+      cpuThought = "Fold"; // 詳細非表示
       message = "CPU Fold。あなたの勝ち！";
       _givePotToWinner(isPlayer: true);
       notifyListeners();
@@ -470,8 +474,6 @@ class PokerGameEngine extends ChangeNotifier {
       message = "CPU: Raise";
       _playerActed = false;
     }
-
-    cpuThought = "勝率: ${(winRate * 100).toStringAsFixed(1)}%\n判断: $action\n($reason)";
     
     _cpuActed = true;
     isPlayerTurn = true;
@@ -517,6 +519,7 @@ class PokerGameEngine extends ChangeNotifier {
         _showDown();
         return;
       case GamePhase.showDown:
+      case GamePhase.gameOver:
         return;
     }
     
@@ -534,6 +537,10 @@ class PokerGameEngine extends ChangeNotifier {
     _phase = GamePhase.showDown;
     if (isPlayer) playerStack += pot; else cpuStack += pot;
     pot = 0;
+    
+    // 破産チェック
+    _checkBankruptcy();
+    
     notifyListeners();
   }
 
@@ -556,7 +563,21 @@ class PokerGameEngine extends ChangeNotifier {
     }
     pot = 0;
     message = "$resultText\nYou:${playerResult.toString()} vs CPU:${cpuResult.toString()}";
+    
+    // 破産チェック
+    _checkBankruptcy();
+
     notifyListeners();
+  }
+
+  void _checkBankruptcy() {
+    if (playerStack <= 0) {
+      _phase = GamePhase.gameOver;
+      message = "YOU LOSE...";
+    } else if (cpuStack <= 0) {
+      _phase = GamePhase.gameOver;
+      message = "YOU WIN!!";
+    }
   }
 }
 
@@ -583,13 +604,12 @@ class _PokerTablePageState extends State<PokerTablePage> {
     WidgetsBinding.instance.addPostFrameCallback((_) { _game.startNewGame(); });
   }
   
-  // クリック音を再生するヘルパー関数
   void _playClickSound() {
     SystemSound.play(SystemSoundType.click);
   }
 
   void _toggleRaiseMode() {
-    _playClickSound(); // 音を再生
+    _playClickSound(); 
     setState(() {
       _isRaising = !_isRaising;
       if (_isRaising) {
@@ -602,7 +622,7 @@ class _PokerTablePageState extends State<PokerTablePage> {
   }
 
   void _confirmRaise() {
-    _playClickSound(); // 音を再生
+    _playClickSound();
     _game.playerAction("Raise", amount: _currentSliderValue.toInt());
     setState(() {
       _isRaising = false;
@@ -613,6 +633,7 @@ class _PokerTablePageState extends State<PokerTablePage> {
   Widget build(BuildContext context) {
     bool canCheck = _game.canCheck;
     int toCall = _game.cpuStreetBet - _game.playerStreetBet;
+    bool isGameOver = _game.phase == GamePhase.gameOver;
 
     return Scaffold(
       body: SafeArea(
@@ -622,22 +643,22 @@ class _PokerTablePageState extends State<PokerTablePage> {
             Expanded(
               flex: 3,
               child: Container(
-                padding: const EdgeInsets.all(8), // パディングを縮小
+                padding: const EdgeInsets.all(8),
                 child: Column(
                   mainAxisAlignment: MainAxisAlignment.center,
                   children: [
                     StackInfoWidget(name: "CPU", stack: _game.cpuStack, isDealer: !_game.isPlayerButton),
-                    const SizedBox(height: 4), // 隙間を縮小
-                    // CPU思考表示を削除
+                    const SizedBox(height: 4),
+                    // カード表示
                     Row(
                       mainAxisAlignment: MainAxisAlignment.center,
-                      children: _game.phase == GamePhase.showDown
+                      children: (_game.phase == GamePhase.showDown || isGameOver)
                           ? _game.cpuHand.map((c) => CardWidget(card: c)).toList()
                           : [const CardBackWidget(), const SizedBox(width: 8), const CardBackWidget()],
                     ),
                     if (_game.cpuStreetBet > 0) 
                       Padding(
-                        padding: const EdgeInsets.only(top: 4), // マージン調整
+                        padding: const EdgeInsets.only(top: 4), 
                         child: ChipPilesWidget(amount: _game.cpuStreetBet)
                       ),
                   ],
@@ -645,16 +666,16 @@ class _PokerTablePageState extends State<PokerTablePage> {
               ),
             ),
             
-            // Community Cards
+            // Community Cards & Message
             Expanded(
               flex: 2,
               child: Column(
                 mainAxisAlignment: MainAxisAlignment.center,
                 children: [
-                  Text("Pot: \$${_game.pot}", style: const TextStyle(color: Colors.yellow, fontSize: 24, fontWeight: FontWeight.bold)), // フォント少し小さく
-                  const SizedBox(height: 8), // 隙間を縮小
+                  Text("Pot: \$${_game.pot}", style: const TextStyle(color: Colors.yellow, fontSize: 24, fontWeight: FontWeight.bold)),
+                  const SizedBox(height: 8),
                   SizedBox(
-                    height: 80, // カード表示エリアを少し小さく
+                    height: 80,
                     child: Row(
                       mainAxisAlignment: MainAxisAlignment.center,
                       children: _game.communityCards.map((c) => Padding(padding: const EdgeInsets.symmetric(horizontal: 4), child: CardWidget(card: c))).toList(),
@@ -664,7 +685,15 @@ class _PokerTablePageState extends State<PokerTablePage> {
                     margin: const EdgeInsets.only(top: 8),
                     padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 4),
                     decoration: BoxDecoration(color: Colors.black45, borderRadius: BorderRadius.circular(16)),
-                    child: Text(_game.message, style: const TextStyle(color: Colors.white, fontSize: 13)), // フォント調整
+                    child: Text(
+                      _game.message, 
+                      textAlign: TextAlign.center,
+                      style: TextStyle(
+                        color: isGameOver ? Colors.orangeAccent : Colors.white, 
+                        fontSize: isGameOver ? 18 : 13,
+                        fontWeight: isGameOver ? FontWeight.bold : FontWeight.normal
+                      )
+                    ),
                   ),
                 ],
               ),
@@ -674,7 +703,7 @@ class _PokerTablePageState extends State<PokerTablePage> {
             Expanded(
               flex: 4,
               child: Container(
-                padding: const EdgeInsets.all(12), // パディング縮小
+                padding: const EdgeInsets.all(12),
                 color: Colors.black26,
                 child: Column(
                   mainAxisAlignment: MainAxisAlignment.center,
@@ -693,12 +722,24 @@ class _PokerTablePageState extends State<PokerTablePage> {
                     const SizedBox(height: 12),
                     
                     // Action Area
-                    if (_game.phase == GamePhase.showDown)
+                    if (isGameOver)
+                      ElevatedButton(
+                        style: ElevatedButton.styleFrom(
+                          backgroundColor: Colors.redAccent, 
+                          padding: const EdgeInsets.symmetric(horizontal: 32, vertical: 16)
+                        ),
+                        onPressed: () {
+                          _playClickSound();
+                          _game.resetWholeGame();
+                        }, 
+                        child: const Text("RESTART GAME", style: TextStyle(color: Colors.white, fontSize: 18, fontWeight: FontWeight.bold)),
+                      )
+                    else if (_game.phase == GamePhase.showDown)
                       ElevatedButton.icon(
                         icon: const Icon(Icons.play_arrow), label: const Text("Next Hand"),
                         style: ElevatedButton.styleFrom(backgroundColor: Colors.white, foregroundColor: Colors.black),
                         onPressed: () {
-                          _playClickSound(); // 音を再生
+                          _playClickSound();
                           _game.startNewGame();
                         }, 
                       )
@@ -809,7 +850,7 @@ class ActionButton extends StatelessWidget {
         padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 12)
       ), 
       onPressed: () {
-        SystemSound.play(SystemSoundType.click); // 音を鳴らす
+        SystemSound.play(SystemSoundType.click); 
         onPressed();
       }, 
       child: Text(label, style: const TextStyle(color: Colors.white))
