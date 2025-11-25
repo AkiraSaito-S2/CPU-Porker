@@ -32,7 +32,6 @@ class PokerApp extends StatelessWidget {
 
 enum Suit { spade, heart, diamond, club }
 enum Rank { two, three, four, five, six, seven, eight, nine, ten, jack, queen, king, ace }
-// gameOverを追加
 enum GamePhase { preFlop, flop, turn, river, showDown, gameOver }
 
 enum HandRank {
@@ -177,14 +176,16 @@ class PokerEvaluator {
 }
 
 class MonteCarloAI {
-  static const int SIMULATION_COUNT = 600;
+  static const int SIMULATION_COUNT = 1000;
 
   static Future<Map<String, dynamic>> decideAction(
       List<CardModel> cpuHand, 
       List<CardModel> communityCards, 
       int pot, 
       int toCall,
-      GamePhase phase, 
+      GamePhase phase,
+      double bluffChance,
+      double raiseThreshold,
   ) async {
     return await Future.delayed(const Duration(milliseconds: 100), () {
       double winRate = _calculateWinRate(cpuHand, communityCards, phase);
@@ -197,13 +198,15 @@ class MonteCarloAI {
         requiredWinRate = toCall / (pot + toCall);
       }
       
-      bool isBluffing = winRate < 0.3 && Random().nextDouble() < 0.10;
+      // 受け取ったパラメータ(bluffChance)を使用
+      bool isBluffing = winRate < 0.3 && Random().nextDouble() < bluffChance;
 
       if (isBluffing) {
         action = 'Raise';
         reason = "Bluff!";
       } else {
-        if (winRate > requiredWinRate + 0.20) {
+        // 受け取ったパラメータ(raiseThreshold)を使用
+        if (winRate > requiredWinRate + raiseThreshold) {
           action = 'Raise';
           reason = "Value Raise";
         } else if (winRate > requiredWinRate) {
@@ -313,6 +316,10 @@ class PokerGameEngine extends ChangeNotifier {
   String message = "ゲーム開始待機中";
   String cpuThought = "";
   
+  // AIパラメータ（ゲームリセットまで固定）
+  double _currentBluffChance = 0.05;
+  double _currentRaiseThreshold = 0.25;
+
   int pot = 0;
   int playerStack = 1000;
   int cpuStack = 1000;
@@ -343,18 +350,37 @@ class PokerGameEngine extends ChangeNotifier {
   
   int get maxRaiseAmount => playerStack + playerStreetBet;
 
-  // 全リセットして最初から始める
+  // コンストラクタ: アプリ起動時に最初の性格を決定
+  PokerGameEngine() {
+    _randomizeCpuParameters();
+  }
+
+  // CPUパラメータの再抽選（ゲームリセット時のみ呼ぶ）
+  void _randomizeCpuParameters() {
+    // bluffChance: 0.03 ~ 0.10
+    _currentBluffChance = 0.03 + Random().nextDouble() * (0.10 - 0.03);
+    
+    // raiseThreshold: 0.20 ~ 0.40
+    // 値が高いほど「より高い勝算」が必要になる＝慎重になる
+    _currentRaiseThreshold = 0.20 + Random().nextDouble() * (0.40 - 0.20);
+
+    print("--- New Game Persona Generated ---");
+    print("BluffChance: ${_currentBluffChance.toStringAsFixed(3)}");
+    print("RaiseThreshold: ${_currentRaiseThreshold.toStringAsFixed(3)}");
+    print("----------------------------------");
+  }
+
+  // 全リセット（チップ復活 ＆ 性格変更）
   void resetWholeGame() {
     playerStack = 1000;
     cpuStack = 1000;
-    // ボタン位置などもリセットしたい場合はここで
-    isPlayerButton = true; 
+    isPlayerButton = true;
+    _randomizeCpuParameters(); // ここで性格を変える
     startNewGame();
   }
 
+  // 新しいハンドを開始（性格は維持）
   void startNewGame() {
-    // 破産チェックはShowDown後に行うため、ここでは自動補充しない
-    
     _deck = Deck();
     playerHand = [_deck.draw(), _deck.draw()];
     cpuHand = [_deck.draw(), _deck.draw()];
@@ -362,6 +388,8 @@ class PokerGameEngine extends ChangeNotifier {
     _phase = GamePhase.preFlop;
     cpuThought = "";
     
+    // パラメータ再抽選ロジックはここから削除しました
+
     isPlayerButton = !isPlayerButton;
     pot = 0;
     playerStreetBet = 0;
@@ -437,17 +465,18 @@ class PokerGameEngine extends ChangeNotifier {
       communityCards, 
       pot, 
       toCall,
-      _phase 
+      _phase,
+      // Engineで保持している（ゲームリセットまで不変の）パラメータを渡す
+      _currentBluffChance,
+      _currentRaiseThreshold,
     );
     
     String action = aiResult['action'];
     double winRate = aiResult['winRate'];
-    // ignore: unused_local_variable
-    double requiredWinRate = aiResult['requiredWinRate'];
     String reason = aiResult['reason'];
 
     if (action == "Fold") {
-      cpuThought = "Fold"; // 詳細非表示
+      cpuThought = "Fold";
       message = "CPU Fold。あなたの勝ち！";
       _givePotToWinner(isPlayer: true);
       notifyListeners();
@@ -461,10 +490,10 @@ class PokerGameEngine extends ChangeNotifier {
       _betCpu(toCall);
       message = "CPU: Call";
     } else if (action == "Raise") {
-      int added = (winRate > 0.8) ? pot : (pot ~/ 2);
-      if (reason == "Bluff!") added = pot ~/ 2; 
+      int baseBet = (winRate > 0.8) ? pot : (pot ~/ 2);
+      if (reason == "Bluff!") baseBet = pot ~/ 2; 
 
-      int raiseAmount = toCall + added;
+      int raiseAmount = toCall + baseBet;
       if (raiseAmount > playerStack + playerStreetBet) {
          raiseAmount = playerStack + playerStreetBet - cpuStreetBet;
       }
@@ -537,10 +566,7 @@ class PokerGameEngine extends ChangeNotifier {
     _phase = GamePhase.showDown;
     if (isPlayer) playerStack += pot; else cpuStack += pot;
     pot = 0;
-    
-    // 破産チェック
     _checkBankruptcy();
-    
     notifyListeners();
   }
 
@@ -563,10 +589,7 @@ class PokerGameEngine extends ChangeNotifier {
     }
     pot = 0;
     message = "$resultText\nYou:${playerResult.toString()} vs CPU:${cpuResult.toString()}";
-    
-    // 破産チェック
     _checkBankruptcy();
-
     notifyListeners();
   }
 
@@ -647,9 +670,12 @@ class _PokerTablePageState extends State<PokerTablePage> {
                 child: Column(
                   mainAxisAlignment: MainAxisAlignment.center,
                   children: [
-                    StackInfoWidget(name: "CPU", stack: _game.cpuStack, isDealer: !_game.isPlayerButton),
+                    StackInfoWidget(
+                      name: "CPU", 
+                      stack: _game.cpuStack, 
+                      isDealer: !_game.isPlayerButton
+                    ),
                     const SizedBox(height: 4),
-                    // カード表示
                     Row(
                       mainAxisAlignment: MainAxisAlignment.center,
                       children: (_game.phase == GamePhase.showDown || isGameOver)
