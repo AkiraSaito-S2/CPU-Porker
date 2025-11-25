@@ -1,4 +1,5 @@
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart'; // システム音のために追加
 import 'dart:math';
 
 void main() {
@@ -26,7 +27,7 @@ class PokerApp extends StatelessWidget {
 }
 
 // ---------------------------------------------------------------------------
-// Models (変更なし)
+// Models
 // ---------------------------------------------------------------------------
 
 enum Suit { spade, heart, diamond, club }
@@ -96,7 +97,7 @@ class Deck {
 }
 
 // ---------------------------------------------------------------------------
-// Evaluator & AI (変更なし)
+// Evaluator & AI (Hand Range Estimation implemented)
 // ---------------------------------------------------------------------------
 
 class HandStrength implements Comparable<HandStrength> {
@@ -176,27 +177,119 @@ class PokerEvaluator {
 
 class MonteCarloAI {
   static const int SIMULATION_COUNT = 600;
-  static Future<Map<String, dynamic>> decideAction(List<CardModel> cpuHand, List<CardModel> communityCards) async {
+
+  static Future<Map<String, dynamic>> decideAction(
+      List<CardModel> cpuHand, 
+      List<CardModel> communityCards, 
+      int pot, 
+      int toCall,
+      GamePhase phase, 
+  ) async {
     return await Future.delayed(const Duration(milliseconds: 100), () {
-      double winRate = _calculateWinRate(cpuHand, communityCards);
-      String action;
-      if (winRate > 0.75) action = 'Raise';
-      else if (winRate > 0.40) action = 'Call';
-      else action = 'Fold';
-      return {'action': action, 'winRate': winRate};
+      double winRate = _calculateWinRate(cpuHand, communityCards, phase);
+      
+      String action = "Fold";
+      String reason = "";
+
+      double requiredWinRate = 0.0;
+      if (toCall > 0) {
+        requiredWinRate = toCall / (pot + toCall);
+      }
+      
+      bool isBluffing = winRate < 0.3 && Random().nextDouble() < 0.10;
+
+      if (isBluffing) {
+        action = 'Raise';
+        reason = "Bluff!";
+      } else {
+        if (winRate > requiredWinRate + 0.20) {
+          action = 'Raise';
+          reason = "Value Raise";
+        } else if (winRate > requiredWinRate) {
+           action = 'Call';
+           reason = "Odds Call";
+        } else {
+           if (toCall == 0) {
+             action = 'Check';
+             reason = "Free Check";
+           } else {
+             action = 'Fold';
+             reason = "Bad Odds";
+           }
+        }
+      }
+
+      if (action == 'Fold' && toCall == 0) {
+        action = 'Check';
+        reason = "Free Check";
+      }
+
+      return {
+        'action': action, 
+        'winRate': winRate,
+        'requiredWinRate': requiredWinRate,
+        'reason': reason
+      };
     });
   }
-  static double _calculateWinRate(List<CardModel> cpuHand, List<CardModel> communityCards) {
+
+  static double _calculateWinRate(List<CardModel> cpuHand, List<CardModel> communityCards, GamePhase phase) {
     int wins = 0, ties = 0, total = SIMULATION_COUNT;
     List<CardModel> knownCards = [...cpuHand, ...communityCards];
-    List<CardModel> deck = Deck.getRemainingCards(knownCards);
+    List<CardModel> deckBase = Deck.getRemainingCards(knownCards);
     int neededCommunity = 5 - communityCards.length;
+    
+    bool applyHandRangeBias = (phase != GamePhase.preFlop);
+
     for (int i = 0; i < total; i++) {
-      deck.shuffle();
+      List<CardModel> deck = List.from(deckBase)..shuffle();
       int deckIndex = 0;
+      List<CardModel> opponentHand = [];
+      
+      if (applyHandRangeBias) {
+        for (int retry = 0; retry < 3; retry++) {
+          CardModel c1 = deck[deckIndex];
+          CardModel c2 = deck[deckIndex + 1];
+          bool isStrong = false;
+          if (c1.rank == c2.rank) isStrong = true;
+          else if (c1.value >= 10 && c2.value >= 10) isStrong = true;
+          else if (c1.rank == Rank.ace || c2.rank == Rank.ace) isStrong = true;
+          
+          if (isStrong) {
+            opponentHand = [c1, c2];
+            deckIndex += 2;
+            break;
+          } else {
+            if (retry < 2 && Random().nextDouble() < 0.7) { 
+              deckIndex += 2; 
+              if (deckIndex + 2 + neededCommunity > deck.length) {
+                 opponentHand = [c1, c2];
+                 deckIndex -= 2; 
+                 deckIndex += 2;
+                 break;
+              }
+              continue; 
+            } else {
+              opponentHand = [c1, c2];
+              deckIndex += 2;
+              break;
+            }
+          }
+        }
+        if (opponentHand.isEmpty) {
+           opponentHand = [deck[0], deck[1]];
+           deckIndex = 2;
+        }
+
+      } else {
+        opponentHand = [deck[deckIndex++], deck[deckIndex++]];
+      }
+
       List<CardModel> simCommunity = List.from(communityCards);
-      for (int j = 0; j < neededCommunity; j++) simCommunity.add(deck[deckIndex++]);
-      List<CardModel> opponentHand = [deck[deckIndex++], deck[deckIndex++]];
+      for (int j = 0; j < neededCommunity; j++) {
+        simCommunity.add(deck[deckIndex++]);
+      }
+      
       HandStrength cpuStrength = PokerEvaluator.evaluate([...cpuHand, ...simCommunity]);
       HandStrength oppStrength = PokerEvaluator.evaluate([...opponentHand, ...simCommunity]);
       int result = cpuStrength.compareTo(oppStrength);
@@ -207,7 +300,7 @@ class MonteCarloAI {
 }
 
 // ---------------------------------------------------------------------------
-// Game Engine (Raise額指定に対応)
+// Game Engine
 // ---------------------------------------------------------------------------
 
 class PokerGameEngine extends ChangeNotifier {
@@ -236,26 +329,17 @@ class PokerGameEngine extends ChangeNotifier {
   GamePhase get phase => _phase;
   bool get canCheck => playerStreetBet == cpuStreetBet;
 
-  // レイズ可能額の計算
-  // 最小レイズ額: 相手のベット額 + (相手のベット額 - 前のベット額) ※基本は相手ベット額の2倍
   int get minRaiseAmount {
     int toCall = cpuStreetBet - playerStreetBet;
-    // チップが足りなければAll-inのみ
     if (playerStack <= toCall) return playerStack + playerStreetBet;
-    
-    // 相手がベットしていない場合(0)はBBがミニマム
     int baseBet = cpuStreetBet > 0 ? cpuStreetBet : bigBlind;
-    int minTotal = baseBet + bigBlind; // 簡易版: 常にBB単位でレイズ可とするか、倍額とするか。
-    // 今回は「相手のベット額の2倍」または「最低BB額」をルールとする
+    int minTotal = baseBet + bigBlind; 
     if (cpuStreetBet > 0) {
       minTotal = cpuStreetBet * 2;
     }
-    
-    // 自分の総ベット額として返す
     return minTotal;
   }
   
-  // 最大レイズ額: 全ツッパ
   int get maxRaiseAmount => playerStack + playerStreetBet;
 
   void startNewGame() {
@@ -308,7 +392,6 @@ class PokerGameEngine extends ChangeNotifier {
     pot += amount;
   }
 
-  // Actionに optional な amount 引数を追加
   void playerAction(String actionType, {int? amount}) {
     if (!isPlayerTurn) return;
 
@@ -325,13 +408,11 @@ class PokerGameEngine extends ChangeNotifier {
       _betPlayer(callAmount);
       message = "プレイヤー: Call ($callAmount)";
     } else if (actionType == "Raise") {
-      // スライダーで指定された「このラウンドの総ベット額」を受け取る
-      int targetTotalBet = amount ?? (cpuStreetBet + bigBlind); // デフォルト
+      int targetTotalBet = amount ?? (cpuStreetBet + bigBlind);
       int additionalChips = targetTotalBet - playerStreetBet;
-      
       _betPlayer(additionalChips);
       message = "プレイヤー: Raise (Total $targetTotalBet)";
-      _cpuActed = false; // CPUに再考させる
+      _cpuActed = false; 
     }
 
     _playerActed = true;
@@ -345,35 +426,41 @@ class PokerGameEngine extends ChangeNotifier {
     message = "CPU: 思考中...";
     notifyListeners();
 
-    final aiResult = await MonteCarloAI.decideAction(cpuHand, communityCards);
+    int toCall = playerStreetBet - cpuStreetBet;
+
+    final aiResult = await MonteCarloAI.decideAction(
+      cpuHand, 
+      communityCards, 
+      pot, 
+      toCall,
+      _phase 
+    );
+    
     String action = aiResult['action'];
     double winRate = aiResult['winRate'];
-    int callAmount = playerStreetBet - cpuStreetBet;
-    
-    if (action == 'Fold' && callAmount == 0) action = 'Check';
-    if (action == 'Call' && winRate < 0.4 && callAmount > cpuStack * 0.2) action = 'Fold';
+    // ignore: unused_local_variable
+    double requiredWinRate = aiResult['requiredWinRate'];
+    String reason = aiResult['reason'];
 
     if (action == "Fold") {
-      cpuThought = "勝率: ${(winRate * 100).toStringAsFixed(1)}% -> Fold";
+      cpuThought = "勝率: ${(winRate * 100).toStringAsFixed(1)}% -> Fold\n($reason)";
       message = "CPU Fold。あなたの勝ち！";
       _givePotToWinner(isPlayer: true);
       notifyListeners();
       return;
-    } else if (action == "Check") {
-       if (callAmount > 0) action = "Call";
     }
 
-    if (action == "Check" || (action == "Call" && callAmount == 0)) {
+    if (action == "Check" || (action == "Call" && toCall == 0)) {
       action = "Check";
       message = "CPU: Check";
     } else if (action == "Call") {
-      _betCpu(callAmount);
+      _betCpu(toCall);
       message = "CPU: Call";
     } else if (action == "Raise") {
-      // CPUのレイズロジック
       int added = (winRate > 0.8) ? pot : (pot ~/ 2);
-      int raiseAmount = callAmount + added;
-      // 相手のスタックを超えないように調整（無駄なオーバーベット防止）
+      if (reason == "Bluff!") added = pot ~/ 2; 
+
+      int raiseAmount = toCall + added;
       if (raiseAmount > playerStack + playerStreetBet) {
          raiseAmount = playerStack + playerStreetBet - cpuStreetBet;
       }
@@ -384,7 +471,8 @@ class PokerGameEngine extends ChangeNotifier {
       _playerActed = false;
     }
 
-    cpuThought = "勝率: ${(winRate * 100).toStringAsFixed(1)}% -> $action";
+    cpuThought = "勝率: ${(winRate * 100).toStringAsFixed(1)}%\n判断: $action\n($reason)";
+    
     _cpuActed = true;
     isPlayerTurn = true;
     notifyListeners();
@@ -473,7 +561,7 @@ class PokerGameEngine extends ChangeNotifier {
 }
 
 // ---------------------------------------------------------------------------
-// UI Widgets (スライダーを追加)
+// UI Widgets
 // ---------------------------------------------------------------------------
 
 class PokerTablePage extends StatefulWidget {
@@ -485,7 +573,6 @@ class PokerTablePage extends StatefulWidget {
 class _PokerTablePageState extends State<PokerTablePage> {
   final PokerGameEngine _game = PokerGameEngine();
   
-  // Raiseモード管理用
   bool _isRaising = false;
   double _currentSliderValue = 0.0;
 
@@ -495,24 +582,27 @@ class _PokerTablePageState extends State<PokerTablePage> {
     _game.addListener(() { setState(() {}); });
     WidgetsBinding.instance.addPostFrameCallback((_) { _game.startNewGame(); });
   }
+  
+  // クリック音を再生するヘルパー関数
+  void _playClickSound() {
+    SystemSound.play(SystemSoundType.click);
+  }
 
   void _toggleRaiseMode() {
+    _playClickSound(); // 音を再生
     setState(() {
       _isRaising = !_isRaising;
       if (_isRaising) {
-        // スライダーの初期値をミニマムレイズ額にセット
         double minRaise = _game.minRaiseAmount.toDouble();
         double maxRaise = _game.maxRaiseAmount.toDouble();
-        
-        // 既にAll-in状態などでスライダーが動かせない場合のガード
         if (minRaise > maxRaise) minRaise = maxRaise;
-        
         _currentSliderValue = minRaise;
       }
     });
   }
 
   void _confirmRaise() {
+    _playClickSound(); // 音を再生
     _game.playerAction("Raise", amount: _currentSliderValue.toInt());
     setState(() {
       _isRaising = false;
@@ -525,7 +615,6 @@ class _PokerTablePageState extends State<PokerTablePage> {
     int toCall = _game.cpuStreetBet - _game.playerStreetBet;
 
     return Scaffold(
-      // AppBarを削除してスペースを確保
       body: SafeArea(
         child: Column(
           children: [
@@ -533,22 +622,24 @@ class _PokerTablePageState extends State<PokerTablePage> {
             Expanded(
               flex: 3,
               child: Container(
-                padding: const EdgeInsets.all(16),
+                padding: const EdgeInsets.all(8), // パディングを縮小
                 child: Column(
                   mainAxisAlignment: MainAxisAlignment.center,
                   children: [
                     StackInfoWidget(name: "CPU", stack: _game.cpuStack, isDealer: !_game.isPlayerButton),
-                    const SizedBox(height: 8),
-                    // CPUの勝率表示（デバッグ用）を非表示にしてスペース確保
-                    // if (_game.cpuThought.isNotEmpty && _game.phase != GamePhase.showDown)
-                    //   Text(_game.cpuThought, style: const TextStyle(color: Colors.lightGreenAccent, fontSize: 12)),
+                    const SizedBox(height: 4), // 隙間を縮小
+                    // CPU思考表示を削除
                     Row(
                       mainAxisAlignment: MainAxisAlignment.center,
                       children: _game.phase == GamePhase.showDown
                           ? _game.cpuHand.map((c) => CardWidget(card: c)).toList()
                           : [const CardBackWidget(), const SizedBox(width: 8), const CardBackWidget()],
                     ),
-                    if (_game.cpuStreetBet > 0) ChipPilesWidget(amount: _game.cpuStreetBet),
+                    if (_game.cpuStreetBet > 0) 
+                      Padding(
+                        padding: const EdgeInsets.only(top: 4), // マージン調整
+                        child: ChipPilesWidget(amount: _game.cpuStreetBet)
+                      ),
                   ],
                 ),
               ),
@@ -560,10 +651,10 @@ class _PokerTablePageState extends State<PokerTablePage> {
               child: Column(
                 mainAxisAlignment: MainAxisAlignment.center,
                 children: [
-                  Text("Pot: \$${_game.pot}", style: const TextStyle(color: Colors.yellow, fontSize: 28, fontWeight: FontWeight.bold)),
-                  const SizedBox(height: 16),
+                  Text("Pot: \$${_game.pot}", style: const TextStyle(color: Colors.yellow, fontSize: 24, fontWeight: FontWeight.bold)), // フォント少し小さく
+                  const SizedBox(height: 8), // 隙間を縮小
                   SizedBox(
-                    height: 90,
+                    height: 80, // カード表示エリアを少し小さく
                     child: Row(
                       mainAxisAlignment: MainAxisAlignment.center,
                       children: _game.communityCards.map((c) => Padding(padding: const EdgeInsets.symmetric(horizontal: 4), child: CardWidget(card: c))).toList(),
@@ -573,7 +664,7 @@ class _PokerTablePageState extends State<PokerTablePage> {
                     margin: const EdgeInsets.only(top: 8),
                     padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 4),
                     decoration: BoxDecoration(color: Colors.black45, borderRadius: BorderRadius.circular(16)),
-                    child: Text(_game.message, style: const TextStyle(color: Colors.white, fontSize: 14)),
+                    child: Text(_game.message, style: const TextStyle(color: Colors.white, fontSize: 13)), // フォント調整
                   ),
                 ],
               ),
@@ -583,29 +674,35 @@ class _PokerTablePageState extends State<PokerTablePage> {
             Expanded(
               flex: 4,
               child: Container(
-                padding: const EdgeInsets.all(16),
+                padding: const EdgeInsets.all(12), // パディング縮小
                 color: Colors.black26,
                 child: Column(
                   mainAxisAlignment: MainAxisAlignment.center,
                   children: [
-                    if (_game.playerStreetBet > 0) ChipPilesWidget(amount: _game.playerStreetBet),
+                    if (_game.playerStreetBet > 0) 
+                      Padding(
+                        padding: const EdgeInsets.only(bottom: 8),
+                        child: ChipPilesWidget(amount: _game.playerStreetBet)
+                      ),
                     Row(
                       mainAxisAlignment: MainAxisAlignment.center,
                       children: _game.playerHand.map((c) => CardWidget(card: c)).toList(),
                     ),
                     const SizedBox(height: 8),
                     StackInfoWidget(name: "YOU", stack: _game.playerStack, isDealer: _game.isPlayerButton),
-                    const SizedBox(height: 16),
+                    const SizedBox(height: 12),
                     
-                    // Action Area (Button or Slider)
+                    // Action Area
                     if (_game.phase == GamePhase.showDown)
                       ElevatedButton.icon(
                         icon: const Icon(Icons.play_arrow), label: const Text("Next Hand"),
                         style: ElevatedButton.styleFrom(backgroundColor: Colors.white, foregroundColor: Colors.black),
-                        onPressed: _game.startNewGame, 
+                        onPressed: () {
+                          _playClickSound(); // 音を再生
+                          _game.startNewGame();
+                        }, 
                       )
                     else if (_isRaising)
-                      // レイズ額設定UI
                       Container(
                         padding: const EdgeInsets.all(12),
                         decoration: BoxDecoration(color: Colors.black54, borderRadius: BorderRadius.circular(12)),
@@ -614,7 +711,7 @@ class _PokerTablePageState extends State<PokerTablePage> {
                           children: [
                             Text(
                               "Raise to: \$${_currentSliderValue.toInt()}", 
-                              style: const TextStyle(color: Colors.white, fontSize: 18, fontWeight: FontWeight.bold)
+                              style: const TextStyle(color: Colors.white, fontSize: 16, fontWeight: FontWeight.bold)
                             ),
                             Slider(
                               value: _currentSliderValue,
@@ -643,7 +740,6 @@ class _PokerTablePageState extends State<PokerTablePage> {
                         ),
                       )
                     else
-                      // 通常のアクションボタン
                       Row(
                         mainAxisAlignment: MainAxisAlignment.spaceEvenly,
                         children: [
@@ -663,7 +759,7 @@ class _PokerTablePageState extends State<PokerTablePage> {
   }
 }
 
-// UI Components (変更なし)
+// UI Components
 class StackInfoWidget extends StatelessWidget {
   final String name; final int stack; final bool isDealer;
   const StackInfoWidget({super.key, required this.name, required this.stack, required this.isDealer});
@@ -707,6 +803,16 @@ class ActionButton extends StatelessWidget {
   const ActionButton({super.key, required this.label, required this.color, required this.onPressed});
   @override
   Widget build(BuildContext context) {
-    return ElevatedButton(style: ElevatedButton.styleFrom(backgroundColor: color, padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 12)), onPressed: onPressed, child: Text(label, style: const TextStyle(color: Colors.white)));
+    return ElevatedButton(
+      style: ElevatedButton.styleFrom(
+        backgroundColor: color, 
+        padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 12)
+      ), 
+      onPressed: () {
+        SystemSound.play(SystemSoundType.click); // 音を鳴らす
+        onPressed();
+      }, 
+      child: Text(label, style: const TextStyle(color: Colors.white))
+    );
   }
 }
